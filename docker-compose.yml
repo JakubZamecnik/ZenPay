@@ -1,17 +1,17 @@
+version: '3.8'
+
 services:
   db:
     image: postgres:16-alpine
     container_name: zenpay_db
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: mysecretpassword
-      POSTGRES_DB: zenpay
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=mysecretpassword
+      - POSTGRES_DB=zenpay
     ports:
       - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zenpay"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -22,11 +22,8 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -34,7 +31,7 @@ services:
   api:
     build: .
     container_name: zenpay_api
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
     environment:
@@ -42,8 +39,6 @@ services:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
     depends_on:
       db:
-        condition: service_healthy
-      rabbitmq:
         condition: service_healthy
 
   worker:
@@ -58,7 +53,3 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-
-volumes:
-  postgres_data:
-

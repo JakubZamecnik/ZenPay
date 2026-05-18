@@ -1,14 +1,16 @@
 import asyncio
 import logging
+import json
 from datetime import datetime, timezone
 import aio_pika
-from sqlmodel import select, delete
+from sqlmodel import delete, text
 from app.config import settings
 from app.db.session import async_session
-from app.models.payment_models import Outbox, IdempotencyKey
+from app.models.payment_models import IdempotencyKey
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outbox_worker")
+
 
 async def clean_expired_idempotency_keys():
     """Úloha, která každou hodinu smaže expirované idempotenční klíče."""
@@ -16,64 +18,89 @@ async def clean_expired_idempotency_keys():
         try:
             async with async_session() as db:
                 now = datetime.now(timezone.utc)
-                # Smaž klíče, kde expires_at je menší než aktuální čas
                 statement = delete(IdempotencyKey).where(IdempotencyKey.expires_at < now)
                 result = await db.exec(statement)
                 await db.commit()
-                
+
                 if result.rowcount > 0:
                     logger.info(f"Úklid: Smazáno {result.rowcount} expirovaných idempotenčních klíčů.")
         except Exception as e:
             logger.error(f"Chyba při čištění idempotenčních klíčů: {e}")
-        
-        # Počkej 1 hodinu (3600 sekund) před dalším úklidem
+
         await asyncio.sleep(3600)
 
+
 async def process_outbox():
-    connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
-    
-    async with connection:
-        channel = await connection.channel()
-        await channel.declare_queue("payment_events", durable=True)
-        logger.info("Outbox Worker úspěšně nastartován a monitoruje databázi...")
+    """Monitoruje databázi a asynchronně publikuje outbox záznamy do RabbitMQ."""
+    while True:
+        try:
+            logger.info("Pokus o připojení k RabbitMQ...")
+            connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
 
-        while True:
-            async with async_session() as db:
-                statement = select(Outbox).where(Outbox.processed_at == None).limit(10)
-                results = await db.exec(statement)
-                entries = results.all()
+            async with connection:
+                channel = await connection.channel()
+                await channel.declare_queue("payment_events", durable=True)
+                logger.info("Outbox Worker úspěšně nastartován a monitoruje databázi...")
 
-                for entry in entries:
-                    try:
-                        logger.info(f"Odesílám událost pro platbu ID {entry.payment_id}")
-                        import json
-                        message_body = json.dumps(entry.payload).encode()
-
-                        await channel.default_exchange.publish(
-                            aio_pika.Message(
-                                body=message_body,
-                                delivery_mode=aio_pika.DeliveryMode.PERSISTENT
-                            ),
-                            routing_key="payment_events",
+                while True:
+                    async with async_session() as db:
+                        # 1. Čtení čistých dat bez ORM mapování (zamezí greenlet chybě)
+                        query = text(
+                            "SELECT id, payment_id, payload FROM outbox WHERE processed_at IS NULL LIMIT 10"
                         )
+                        result = await db.execute(query)
+                        entries = result.fetchall()
 
-                        entry.processed_at = datetime.now(timezone.utc)
-                        db.add(entry)
-                        await db.commit()
-                        logger.info(f"Událost outboxu {entry.id} úspěšně zpracována.")
+                        for entry_id, payment_id, payload in entries:
+                            try:
+                                logger.info(f"Odesílám událost pro platbu ID {payment_id}")
 
-                    except Exception as e:
-                        await db.rollback()
-                        logger.error(f"Chyba při odesílání outbox záznamu {entry.id}: {e}")
-            
-            await asyncio.sleep(2)
+                                if isinstance(payload, str):
+                                    message_body = payload.encode()
+                                else:
+                                    message_body = json.dumps(payload).encode()
+
+                                # 2. Publikace do RabbitMQ
+                                await channel.default_exchange.publish(
+                                    aio_pika.Message(
+                                        body=message_body,
+                                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                                    ),
+                                    routing_key="payment_events",
+                                )
+
+                                # 3. Čistý asynchronní update podle ID
+                                update_stmt = text("UPDATE outbox SET processed_at = :now WHERE id = :id")
+                                await db.execute(
+                                    update_stmt,
+                                    {
+                                        "now": datetime.now(timezone.utc).replace(tzinfo=None),
+                                        "id": entry_id,
+                                    },
+                                )
+                                await db.commit()
+                                logger.info(f"Událost outboxu {entry_id} úspěšně zpracována.")
+
+                            except Exception as e:
+                                await db.rollback()
+                                logger.error(f"Chyba při odesílání outbox záznamu {entry_id}: {e}")
+
+                    await asyncio.sleep(2)
+
+        except (OSError, aio_pika.exceptions.AMQPConnectionError) as e:
+            logger.warning(f"RabbitMQ server není dostupný ({e}). Nový pokus za 3 sekundy...")
+            await asyncio.sleep(3)
+        except Exception as e:
+            logger.error(f"Neočekávaná chyba ve workeru: {e}. Restartuji smyčku za 5 sekund...")
+            await asyncio.sleep(5)
+
 
 async def main():
-    # Spustíme obě asynchronní funkce paralelně vedle sebe
     await asyncio.gather(
         process_outbox(),
-        clean_expired_idempotency_keys()
+        clean_expired_idempotency_keys(),
     )
+
 
 if __name__ == "__main__":
     try:
