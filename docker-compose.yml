@@ -37,6 +37,9 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:mysecretpassword@db:5432/zenpay
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    volumes:
+      - ./app:/app/app
+      - ./tests:/app/tests
     depends_on:
       db:
         condition: service_healthy
@@ -48,6 +51,8 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:mysecretpassword@db:5432/zenpay
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    volumes:
+      - ./app:/app/app
     depends_on:
       db:
         condition: service_healthy
